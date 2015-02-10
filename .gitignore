@@ -3,6 +3,8 @@ Lasagne/
 *npz
 spynet/
 .idea
+*.pkl
+*.jpeg
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

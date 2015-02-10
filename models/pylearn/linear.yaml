@@ -1,0 +1,46 @@
+!obj:pylearn2.train.Train {
+    dataset: &train !obj:ift6266h15.code.pylearn2.datasets.variable_image_dataset.DogsVsCats {
+        transformer: &transformer !obj:ift6266h15.code.pylearn2.datasets.variable_image_dataset.RandomCrop {
+            scaled_size: 256,
+            crop_size: 221,
+        },
+        start: 0,
+        stop: 20000,
+    },
+    model: !obj:pylearn2.models.mlp.MLP {
+        nvis: 146523,
+        layers: [
+            !obj:pylearn2.models.mlp.Softmax {
+                layer_name: 'y',
+                n_classes: 2,
+                irange: 0.01,
+            },
+        ],
+    },
+    algorithm: !obj:pylearn2.training_algorithms.sgd.SGD {
+        batch_size: &batch_size 100,
+        train_iteration_mode: 'batchwise_shuffled_sequential',
+        batches_per_iter: 10,
+        monitoring_batch_size: *batch_size,
+        monitoring_batches: 10,
+        monitor_iteration_mode: 'batchwise_shuffled_sequential',
+        learning_rate: 1e-3,
+        learning_rule: !obj:pylearn2.training_algorithms.learning_rule.Momentum {
+            init_momentum: 0.95
+        },
+        monitoring_dataset: {
+            'train' : *train,
+            'valid': !obj:ift6266h15.code.pylearn2.datasets.variable_image_dataset.DogsVsCats {
+                transformer: *transformer,
+                start: 20000,
+                stop: 25000,
+            },
+        },
+        cost: !obj:pylearn2.costs.cost.MethodCost {
+            method: 'cost_from_X',
+        },
+        termination_criterion: !obj:pylearn2.termination_criteria.EpochCounter {
+            max_epochs: 10
+        },
+    },
+}
