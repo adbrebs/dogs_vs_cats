@@ -8,80 +8,83 @@ import numpy as np
 import theano
 import theano.tensor as T
 theano.config.floatX = "float32"
-import Lasagne.lasagne as lasagne
+import lasagne
 
 from dataset import *
-from models.lasagne.mod4 import build_model
+from models.mod_8 import Network_8
+from updates import momentum_bis
 
 
-def create_iter_functions(output_layer, learning_rate, momentum):
+def create_iter_functions(model, learning_rate, momentum):
 
     print("Creating training functions...")
 
-    X_batch = T.tensor4('x')
     y_batch = T.ivector('y')
+    l_out = model.l_out
 
-    objective = lasagne.objectives.Objective(output_layer, loss_function=lasagne.objectives.multinomial_nll)
+    objective = lasagne.objectives.Objective(l_out, loss_function=lasagne.objectives.multinomial_nll)
 
-    loss_train = objective.get_loss(X_batch, target=y_batch)
-    loss_eval = objective.get_loss(X_batch, target=y_batch, deterministic=True)
+    loss_train = objective.get_loss(target=y_batch)
+    loss_eval = objective.get_loss(target=y_batch, deterministic=True)
 
     # pred = T.cast(T.switch(
-    #     output_layer.get_output(X_batch, deterministic=True) < 0.5, 0, 1), 'int32')
+    #     l_out.get_output(deterministic=True) < 0.5, 0, 1), 'int32')
     pred = T.argmax(
-        output_layer.get_output(X_batch, deterministic=True), axis=1)
+        l_out.get_output(deterministic=True), axis=1)
     error_rate = T.mean(T.neq(pred, y_batch))
 
-    f_pred = theano.function([X_batch], [output_layer.get_output(X_batch, deterministic=True)])
+    Xs_batch = [l_in.input_var for l_in in model.l_ins]
+    f_pred = theano.function(Xs_batch, [l_out.get_output(deterministic=True)], on_unused_input='ignore')
 
-    all_params = lasagne.layers.get_all_params(output_layer)
-    updates = lasagne.updates.momentum(loss_train, all_params, learning_rate, momentum)
+    all_params = lasagne.layers.get_all_params(l_out)
+    updates, extra_params = momentum_bis(loss_train, all_params, learning_rate, momentum)
     # updates = lasagne.updates.adadelta(loss_train, all_params, learning_rate)
     # updates = lasagne.updates.sgd(loss_train, all_params, learning_rate)
 
     iter_train = theano.function(
-        [X_batch, y_batch], [loss_train, error_rate],
+        Xs_batch + [y_batch], [loss_train, error_rate],
         updates=updates
     )
 
     iter_valid = theano.function(
-        [X_batch, y_batch], [loss_eval, error_rate]
+        Xs_batch + [y_batch], [loss_eval, error_rate]
     )
 
     iter_test = theano.function(
-        [X_batch, y_batch], [loss_eval, error_rate]
+        Xs_batch + [y_batch], [loss_eval, error_rate]
     )
 
     return dict(
         train=iter_train,
         valid=iter_valid,
         test=iter_test,
-        f_pred=f_pred
+        f_pred=f_pred,
+        params_learning_rule=extra_params
     )
 
 
 def iter_over_epoch(iterator, iter_fun, losses, error_rates):
     batch_losses = []
-    batch_err = []
-    for b, (X_batch, y_batch) in enumerate(iterator):
-        if len(X_batch) == 1:
-            X_batch = X_batch[0]
-        print "\r{}/{}".format(b, iterator.n_batches),
+    batch_errors = []
+    for b, ([(batch, _)], qsize) in enumerate(iterator.parallel_generation()):
+        print "\r{}/{}, qsize {}".format(b, iterator.n_batches, qsize),
         sys.stdout.flush()
-        batch_loss, batch_err = iter_fun(X_batch, y_batch)
+        batch_loss, batch_err = iter_fun(*batch)
         batch_losses.append(batch_loss)
-        batch_err.append(batch_err)
+        batch_errors.append(batch_err)
     print ""
     avg_loss = np.mean(batch_losses)
-    avg_err = np.mean(batch_err)
+    avg_err = np.mean(batch_errors)
     losses.append(avg_loss)
     error_rates.append(avg_err)
     return avg_loss, avg_err
 
 
-def train(iter_funcs, output_layer,
+
+def train(iter_funcs, model,
           dataset_train, dataset_valid,
-          batch_size, learning_rate, patience_max,
+          batch_size, learning_rate, momentum, patience_max,
+          data_aug_train, data_aug_valid, n_procs,
           num_training_batches_per_epoch=None,
           num_validation_batches_per_epoch=None,
           write_path="./", name_experiment="mod", save_freq=10):
@@ -101,8 +104,10 @@ def train(iter_funcs, output_layer,
     for epoch in itertools.count(1):
 
         start = time.time()
-        train_iterator = dataset_train.get_iterator(batch_size, num_training_batches_per_epoch)
-        valid_iterator = dataset_valid.get_iterator(batch_size, num_validation_batches_per_epoch)
+        train_iterator = dataset_train.get_iterator(data_aug_train, batch_size, n_procs,
+                                                    num_training_batches_per_epoch)
+        valid_iterator = dataset_valid.get_iterator(data_aug_valid, batch_size, n_procs,
+                                                    num_validation_batches_per_epoch)
 
         train_avg_loss, train_avg_err = iter_over_epoch(train_iterator, iter_funcs["train"],
                                                         channels_train["loss"], channels_train["err"])
@@ -115,15 +120,13 @@ def train(iter_funcs, output_layer,
 
         if epoch >= save_freq and epoch%save_freq==0:
             print("Saving model..." + name_experiment)
-            pickle.dump(output_layer, open(write_path + "mod.pkl", "wb"))
-            pickle.dump(epochs_lr_change, open(write_path + "lr.pkl", "wb"))
+            pickle.dump(model, open(write_path + "mod.pkl", "wb"))
 
-        last_valid_err = channels_valid["err"][-1]
-        if last_valid_err < lowest_valid_error:
+        if valid_avg_err < lowest_valid_error:
             patience = 0
-            lowest_valid_error = last_valid_err
+            lowest_valid_error = valid_avg_err
             print("Saving best model..." + name_experiment)
-            pickle.dump(output_layer, open(write_path + name_best_model, "wb"))
+            pickle.dump(model, open(write_path + name_best_model, "wb"))
         else:
             if patience == patience_max:
                 patience = 0
@@ -131,11 +134,17 @@ def train(iter_funcs, output_layer,
                 print "new learning rate: " + str(new_lr)
                 learning_rate.set_value(new_lr)
                 epochs_lr_change.append((epoch, new_lr))
+                pickle.dump(epochs_lr_change, open(write_path + "lr.pkl", "wb"))
                 # We continue from our best model so far
-                output_layer = pickle.load( open( write_path + name_best_model, "rb" ) )
+                model2 = pickle.load(open(write_path + name_best_model, "rb"))
+                model.copy_from_other_model(model2)
+                del model2
+                # Set the variables of the momentum to zero!
+                for s_param in iter_funcs["params_learning_rule"]:
+                    s_param.set_value(np.zeros_like(s_param.get_value()))
             else:
                 patience += 1
-
+        print "best: " + str(lowest_valid_error)
         yield {
             'number': epoch,
             'elapsed_time': end - start,
@@ -149,34 +158,52 @@ def train(iter_funcs, output_layer,
 if __name__ == '__main__':
 
     # Setup
-    name_experiment="mod_4_dropout_da_lr_decrease"
+    n_chunks = 5
+    name_experiment="mod_8_all"
     write_path = "/Tmp/debrea/cat/" + name_experiment + "/"
     if not os.path.exists(write_path):
         os.makedirs(write_path)
+    n_procs = multiprocessing.cpu_count()-3
 
     num_epochs = 1000
-    batch_size = 50
+    batch_size = 20
     initial_lr = 1e-2
     momentum = 0.9
-    patience_max = 5
-    image_width = 260
-    min_side = 260
+    patience_max = 15
 
     # Data_agumentation
-    d1 = ScaleMinSide(min_side)
-    d2 = RandomCropping(image_width, child=d1)
-    d3 = Randomize(HorizontalFlip(child=d2), 0.5)
-    d4 = RandomRotate(30, child=d3)
-    d_train = d4
-    d_valid = d2
+    image_width = 260
+    min_side = 260 # TODO BUG
+
+    scale_min = ScaleMinSide(min_side)
+    crop = RandomCropping(image_width)
+
+    # rot = RandomRotate(30, child=crop)
+    #
+    # rot = RandomRotate(30, child=rot)
+    # rot = RandomRotate(30, child=rot)
+    # rot = RandomRotate(30, child=rot)
+    # rot = RandomRotate(30, child=rot)
+
+    # scale = Scale((image_width,image_width,3))
+    #
+    # choose = RandomizeMultiple([scale, crop])
+    #
+    h_flip = HorizontalFlip()
+    rand_h_flip = RandomizeSingle(h_flip, 0.5, child=crop)
+    rot_30 = RandomRotate(30, child=rand_h_flip)
+    d5 = ParallelDataAugmentator([rot_30]*n_chunks, child=scale_min)
+    d_train = d5
+    d_valid = d5
     pickle.dump((d_train, d_valid), open(write_path + "data_agumentation.pkl", "wb"))
 
     # Creation of the datasets
-    dataset_train = Dataset(start=0, stop=20000, data_augmentator=d_train)
-    dataset_valid = Dataset(start=20000, stop=22500, data_augmentator=d_valid)
+    dataset_train = Dataset(start=0, stop=20000)
+    dataset_valid = Dataset(start=20000, stop=22500)
 
     # Creation of the model
-    output_layer = build_model(
+    model = Network_8(
+        n_chunks=n_chunks,
         input_height=image_width,
         input_width=image_width,
         output_dim=2,
@@ -185,10 +212,12 @@ if __name__ == '__main__':
 
     # Creation of the iterative functions
     learning_rate = theano.shared(numpy.float32(initial_lr), "learning_rate")
-    iter_funcs = create_iter_functions(output_layer, learning_rate, momentum)
+    momentum = theano.shared(numpy.float32(momentum), "momentum")
+    iter_funcs = create_iter_functions(model, learning_rate, momentum)
 
-    epochs = train(iter_funcs, output_layer, dataset_train,
-                   dataset_valid, batch_size, learning_rate, patience_max,
+    epochs = train(iter_funcs, model, dataset_train,
+                   dataset_valid, batch_size, learning_rate, momentum, patience_max,
+                   d_train, d_valid, n_procs,
                    num_training_batches_per_epoch=None,
                    num_validation_batches_per_epoch=None,
                    write_path=write_path, name_experiment=name_experiment,

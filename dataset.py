@@ -6,6 +6,10 @@ import scipy
 import matplotlib.pyplot as plt
 import tables
 import time
+import shutil
+import math
+import multiprocessing
+from sys import getsizeof
 
 from scipy import misc
 from pylearn2.utils.string_utils import preprocess
@@ -14,129 +18,218 @@ import theano
 
 
 class Dataset():
-    _default_seed = 2015 + 1 + 17
-
-    def __init__(self, start, stop, data_augmentator):
+    def __init__(self, start, stop, path=None):
         self.start = start
         self.stop = stop
-        self.n_data = stop - start
-        self.data_augmentator = data_augmentator
+        self.n_data = self.stop - self.start
 
-        path=os.path.join(
-            '${PYLEARN2_DATA_PATH}', 'dogs_vs_cats', 'train.h5')
-        data_node='Data'
-
+        if path is None:
+            path=os.path.join(
+                '${PYLEARN2_DATA_PATH}', 'dogs_vs_cats', 'train.h5')
         # Locally cache the files before reading them
         path = preprocess(path)
         dataset_cache = cache.datasetCache
-        path = dataset_cache.cache_file(path)
+        self.path = dataset_cache.cache_file(path)
+        self.h5file = tables.openFile(self.path, mode="r")
+        node = self.h5file.getNode('/', 'Data')
 
-        self.h5file = tables.openFile(path, mode="r")
-        node = self.h5file.getNode('/', data_node)
+        print "   load data on RAM"
+        self.h5_x = getattr(node, 'X')[self.start:self.stop]
+        s = 0
+        for img in self.h5_x:
+            s += img.nbytes
+        print "      size: " + str(s / 1024**2)
+        self.h5_s = getattr(node, 's')[self.start:self.stop]
+        self.h5_y = getattr(node, 'y')[self.start:self.stop]
+        print "      end load"
 
-        self.x = getattr(node, 'X')
-        self.s = getattr(node, 's')
-        self.y = getattr(node, 'y')
-
-        # If you want to display some images
-        # a = scipy.ndimage.interpolation.zoom(self.x[0].reshape(self.s[0]), (3, 3, 1), order=0)
-        # plt.imshow(a)
-        # plt.show()
-
-    def get_iterator(self, batch_size, n_batches=None):
-        return DataIterator(self, batch_size, self.data_augmentator, n_batches=n_batches)
+    def get_iterator(self, data_augmentator, batch_size, n_procs, n_batches=None):
+        return DataIterator(self, batch_size, data_augmentator, n_procs, n_batches=n_batches)
 
 
 class DataIterator(object):
-    def __init__(self, dataset, batch_size, data_augmentator, n_batches=None):
+    """
+    Manages the batch creation with a data_augmentator scheme
+    """
+    def __init__(self, dataset, batch_size, data_augmentator, n_procs, n_batches=None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.data_augmentator = data_augmentator
+        self.n_procs = n_procs
         if n_batches is None:
             self.n_batches = dataset.n_data / batch_size
         else:
             self.n_batches = n_batches
         self.batch_id = 0
-        self.permutation = dataset.start + numpy.random.permutation(dataset.n_data)
+
+        self.permutation = numpy.random.permutation(dataset.n_data)
+
         self.shape_batch = [(batch_size,) + sh for sh in
-                            data_augmentator.get_final_shape()]
-        self.n_chunks = data_augmentator.get_number_chunks()
+                            data_augmentator.get_final_shape([None])]
 
-    def __iter__(self):
-        return self
+    def get_batch(self, idx_batch):
+        """
+        Returns a single batch corresponding to idx_batch
+        """
+        pos = idx_batch * self.batch_size
+        indices = self.permutation[pos: pos + self.batch_size]
+        return [(self.dataset.h5_x[i], self.dataset.h5_s[i], self.dataset.h5_y[i]) for i in indices], indices
 
-    # Python 3 compatibility
-    def __next__(self):
-        return self.next()
+    def get_batches(self, idx_batches):
+        """
+        Returns several batches correponding to idx_batches
+        """
+        batches = [0]*len(idx_batches)
+        indices = [0]*len(idx_batches)
+        for i, idx in enumerate(idx_batches):
+            batches[i], indices[i] = self.get_batch(idx)
+        return batches, indices
 
-    def next(self):
-        if self.batch_id < self.n_batches:
-            pos = self.batch_id * self.batch_size
-            self.batch_id += 1
-            idx = self.permutation[pos: pos + self.batch_size]
-            xs = []
-            for chunk in range(self.n_chunks):
-                xs.append(numpy.zeros(self.shape_batch[chunk],
-                                      dtype=theano.config.floatX))
-            y = numpy.zeros((self.batch_size,), dtype='int32')
+    def generate_sequence(self, batch, batch_of_indices):
 
-            for i in xrange(self.batch_size):
-                real_idx = idx[i]
-                img = numpy.reshape(self.dataset.x[real_idx], self.dataset.s[real_idx])
-                new_imgs = self.data_augmentator.process_image(img)
-                if not isinstance(new_imgs, list):
-                    new_imgs = [new_imgs]
-                # plt.imshow(img)
-                # plt.show()
-                for a, img in enumerate(new_imgs):
-                    xs[a][i] = img
-                y[i] = self.dataset.y[real_idx]
+        x = []
+        for shape in self.shape_batch:
+            x.append(numpy.zeros(shape, dtype=theano.config.floatX))
 
-            for a in range(len(xs)):
-                xs[a] = numpy.swapaxes(xs[a], 3, 2)
-                xs[a] = numpy.swapaxes(xs[a], 2, 1)
-                xs[a] = xs[a]/255.0 - 0.5
+        y = numpy.zeros((self.batch_size,), dtype='int32')
 
-            return xs, y
-        else:
-            raise StopIteration()
+        for i, (img, s, target) in enumerate(batch):
+            img = numpy.reshape(img, s)
+            new_imgs = self.data_augmentator.process_image([img])
+
+            y[i] = target
+            for a, img in enumerate(new_imgs):
+                x[a][i] = img
+
+        for a in range(len(x)):
+            x[a] = self.swap_axis_and_norm(x[a])
+
+        return x + [y], batch_of_indices + self.dataset.start
+
+    def parallel_generation(self, n_times=1, num_cached=30):
+        """
+        Sequence
+        """
+        try:
+            queue = multiprocessing.Queue(maxsize=num_cached)
+
+            n_batches = self.dataset.n_data / self.batch_size
+            batches = range(n_batches)
+            n_batches_per_proc = int(math.ceil(float(n_batches) / self.n_procs))
+            proc_idx_batches = [batches[i:i + n_batches_per_proc]
+                                for i in range(0, (self.n_procs-1)*n_batches_per_proc, n_batches_per_proc)]
+            proc_idx_batches.append(batches[(self.n_procs-1)*n_batches_per_proc:])
+
+            # define producer (putting items into queue)
+            def producer(batches_of_points, batches_of_indices):
+                for batch_of_points, batch_of_indices in zip(batches_of_points, batches_of_indices):
+                    queue.put([self.generate_sequence(batch_of_points, batch_of_indices)
+                               for _ in range(n_times)])
+
+            threads = []
+            for i in xrange(self.n_procs):
+                thread = multiprocessing.Process(
+                    target=producer,
+                    args=self.get_batches(proc_idx_batches[i]))
+                thread.start()
+                threads.append(thread)
+
+            # run as consumer (read items from queue, in current thread)
+            for i in range(n_batches):
+                yield queue.get(), queue.qsize()
+        except:
+            print "SALUT TOI"
+            for th in threads:
+                th.terminate()
+            queue.close()
+            raise
+
+    def swap_axis_and_norm(self, a):
+        a = numpy.swapaxes(a, 3, 2)
+        a = numpy.swapaxes(a, 2, 1)
+        return a/255.0 - 0.5
 
 
 class DataAugmentator():
     def __init__(self, child=None):
         self.child = child
 
-    def process_image(self, img):
+    def process_image(self, ls_imgs):
+        """
+        Takes a list of images as argument.
+        Returns a list of images (can be a list with a single element.
+        """
         # plt.imshow(img)
         # plt.show()
         if self.child is not None:
-            img = self.child.process_image(img)
-        img = self.process_image_virtual(img)
+            ls_imgs = self.child.process_image(ls_imgs)
+
+        ls_new_imgs = []
+        for img in ls_imgs:
+            ls_new_imgs += self.process_image_virtual(img)
         # plt.imshow(img)
         # plt.show()
-        return img
-
-    def get_final_shape(self):
-        if self.child is not None:
-            return self.child.get_final_shape()
-
-    def get_number_chunks(self):
-        return 1
+        return ls_new_imgs
 
     def process_image_virtual(self, img):
+        """
+        Takes a single image (not in a list) as argument.
+        Returns a list of images (can be a list with a single element.
+        """
         raise NotImplementedError
 
+    def get_final_shape(self, ls_shapes):
+        """
+        If you know that a child or a parent will return a fixed shape, ls_shapes
+        can be set to None.
+        """
+        if self.child is not None:
+            ls_shapes = self.child.get_final_shape(ls_shapes)
 
-class Randomize(DataAugmentator):
-    def __init__(self, d_a, probability=0.5):
-        DataAugmentator.__init__(self, child=d_a.child)
+        ls_new_shapes = []
+        for shape in ls_shapes:
+            ls_new_shapes += self.get_final_shape_virtual(shape)
+
+        return ls_new_shapes
+
+    def get_final_shape_virtual(self, shape):
+        return [shape]
+
+
+class RandomizeSingle(DataAugmentator):
+    def __init__(self, d_a, probability=0.5, child=None):
+        DataAugmentator.__init__(self, child=child)
         self.d_a = d_a
         self.probability = probability
 
     def process_image_virtual(self, img):
         if numpy.random.uniform() < self.probability:
-            img = self.d_a.process_image_virtual(img)
-        return img
+            ls_imgs = self.d_a.process_image([img])
+            return ls_imgs
+        else:
+            return [img]
+
+
+class RandomizeMultiple(DataAugmentator):
+    """
+    assumes all the da have the final shape and same number of chunks
+    """
+    def __init__(self, ls_d_a, ls_probabilities=None, child=None):
+        DataAugmentator.__init__(self, child=child)
+        self.ls_d_a = ls_d_a
+        self.n_da = len(ls_d_a)
+        if ls_probabilities is not None:
+            self.ls_probabilities = ls_probabilities
+        else:
+            self.ls_probabilities = [1.0/self.n_da]*self.n_da
+
+    def process_image_virtual(self, img):
+        id_da = numpy.random.choice(self.n_da, p=self.ls_probabilities)
+        ls_imgs = self.ls_d_a[id_da].process_image([img])
+        return ls_imgs
+
+    def get_final_shape_virtual(self, shape):
+        return self.ls_d_a[0].get_final_shape([shape])
 
 
 class ScaleMinSide(DataAugmentator):
@@ -149,7 +242,14 @@ class ScaleMinSide(DataAugmentator):
         ratio = self.min_side / float(min_axis)
         # a = scipy.ndimage.interpolation.zoom(img, (ratio, ratio, 1), order=0)
         a = misc.imresize(img, ratio)
-        return a
+        return [a]
+
+    def get_final_shape_virtual(self, shape):
+        if shape is None:
+            return [None]
+        min_axis = min(shape[0:2])
+        ratio = self.min_side / float(min_axis)
+        return [(shape[0] * ratio, shape[1] * ratio, shape[2])]
 
 
 class ScaleMinSideOnlyIfSmaller(DataAugmentator):
@@ -166,7 +266,14 @@ class ScaleMinSideOnlyIfSmaller(DataAugmentator):
             return img
         ratio = self.min_side / float(min_axis)
         a = misc.imresize(img, ratio)
-        return a
+        return [a]
+
+    def get_final_shape_virtual(self, shape):
+        min_axis = min(shape[0:2])
+        if min_axis >= self.min_side:
+            return [shape]
+        ratio = self.min_side / float(min_axis)
+        return [(shape[0] * ratio, shape[1] * ratio, shape[2])]
 
 
 class Scale(DataAugmentator):
@@ -175,10 +282,13 @@ class Scale(DataAugmentator):
         self.new_scale = new_scale
 
     def process_image_virtual(self, img):
-        ratio0 = self.new_scale[0] / img.shape[0]
-        ratio1 = self.new_scale[1] / img.shape[1]
+        ratio0 = self.new_scale[0] / float(img.shape[0])
+        ratio1 = self.new_scale[1] / float(img.shape[1])
         a = scipy.ndimage.interpolation.zoom(img, (ratio0, ratio1, 1), order=0)
-        return a
+        return [a]
+
+    def get_final_shape_virtual(self, shape):
+        return [self.new_scale]
 
 
 class ScaleOnlyIfSmaller(DataAugmentator):
@@ -190,7 +300,12 @@ class ScaleOnlyIfSmaller(DataAugmentator):
         ratio0 = max(self.new_scale[0] / img.shape[0], img.shape[0])
         ratio1 = max(self.new_scale[1] / img.shape[1], img.shape[1])
         a = scipy.ndimage.interpolation.zoom(img, (ratio0, ratio1, 1), order=0)
-        return a
+        return [a]
+
+    def get_final_shape_virtual(self, shape):
+        ratio0 = max(self.new_scale[0] / shape[0], shape[0])
+        ratio1 = max(self.new_scale[1] / shape[1], shape[1])
+        return [(shape[0] * ratio0, shape[1] * ratio1, shape[2])]
 
 
 class Zoom(DataAugmentator):
@@ -200,7 +315,10 @@ class Zoom(DataAugmentator):
 
     def process_image_virtual(self, img):
         a = misc.imresize(img, self.zoom)
-        return a
+        return [a]
+
+    def get_final_shape_virtual(self, shape):
+        return [(shape[0] * self.zoom, shape[1] * self.zoom, shape[2])]
 
 
 class RandomCropping(DataAugmentator):
@@ -208,14 +326,14 @@ class RandomCropping(DataAugmentator):
         DataAugmentator.__init__(self, child)
         self.crop_size = crop_size
 
-    def get_final_shape(self):
-        return self.crop_size, self.crop_size, 3
-
     def process_image_virtual(self, img):
         lx, ly, _ = img.shape
         pos_x = numpy.random.randint(0, 1 + lx - self.crop_size)
         pos_y = numpy.random.randint(0, 1 + ly - self.crop_size)
-        return img[pos_x:pos_x+self.crop_size, pos_y:pos_y+self.crop_size, :]
+        return [img[pos_x:pos_x+self.crop_size, pos_y:pos_y+self.crop_size, :]]
+
+    def get_final_shape_virtual(self, shape):
+        return [(self.crop_size, self.crop_size, 3)]
 
 
 class HorizontalFlip(DataAugmentator):
@@ -227,7 +345,19 @@ class HorizontalFlip(DataAugmentator):
         new_image[:,:,0] = numpy.fliplr(img[:,:,0])
         new_image[:,:,1] = numpy.fliplr(img[:,:,1])
         new_image[:,:,2] = numpy.fliplr(img[:,:,2])
-        return new_image
+        return [new_image]
+
+
+class VerticalFlip(DataAugmentator):
+    def __init__(self, child=None):
+        DataAugmentator.__init__(self, child)
+
+    def process_image_virtual(self, img):
+        new_image = numpy.empty_like(img)
+        new_image[:,:,0] = numpy.flipud(img[:,:,0])
+        new_image[:,:,1] = numpy.flipud(img[:,:,1])
+        new_image[:,:,2] = numpy.flipud(img[:,:,2])
+        return [new_image]
 
 
 class RandomRotate(DataAugmentator):
@@ -237,7 +367,7 @@ class RandomRotate(DataAugmentator):
 
     def process_image_virtual(self, img):
         angle = numpy.random.randint(-self.max_angle, self.max_angle)
-        return scipy.ndimage.interpolation.rotate(img, angle, reshape=False, mode="nearest", order=0)
+        return [scipy.ndimage.interpolation.rotate(img, angle, reshape=False, mode="nearest", order=0)]
 
 
 class RotatePreciseAngle(DataAugmentator):
@@ -246,7 +376,7 @@ class RotatePreciseAngle(DataAugmentator):
         self.angle = angle
 
     def process_image_virtual(self, img):
-        return scipy.ndimage.interpolation.rotate(img, self.angle, reshape=False, mode="nearest", order=0)
+        return [scipy.ndimage.interpolation.rotate(img, self.angle, reshape=False, mode="nearest", order=0)]
 
 
 class ParallelDataAugmentator(DataAugmentator):
@@ -259,14 +389,14 @@ class ParallelDataAugmentator(DataAugmentator):
         self.data_augmentators = data_agumentators
 
     def process_image_virtual(self, img):
-        new_images = []
+        ls_new_imgs = []
         for d_a in self.data_augmentators:
-            new_images.append(d_a.process_image(img))
-        return new_images
+            ls_new_imgs += d_a.process_image([img])
+        return ls_new_imgs
 
-    def get_number_chunks(self):
-        return len(self.data_augmentators)
-
-    def get_final_shape(self):
-        return [d_a.get_final_shape() for d_a in self.data_augmentators]
+    def get_final_shape_virtual(self, shape):
+        ls_new_shapes = []
+        for d_a in self.data_augmentators:
+            ls_new_shapes += d_a.get_final_shape([shape])
+        return ls_new_shapes
 
