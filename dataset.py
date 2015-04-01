@@ -30,18 +30,21 @@ class Dataset():
         path = preprocess(path)
         dataset_cache = cache.datasetCache
         self.path = dataset_cache.cache_file(path)
-        self.h5file = tables.openFile(self.path, mode="r")
-        node = self.h5file.getNode('/', 'Data')
 
         print "   load data on RAM"
+        self.h5file = tables.openFile(self.path, mode="r")
+        node = self.h5file.getNode('/', 'Data')
         self.h5_x = getattr(node, 'X')[self.start:self.stop]
+        self.h5_s = getattr(node, 's')[self.start:self.stop]
+        self.h5_y = getattr(node, 'y')[self.start:self.stop]
         s = 0
         for img in self.h5_x:
             s += img.nbytes
         print "      size: " + str(s / 1024**2)
-        self.h5_s = getattr(node, 's')[self.start:self.stop]
-        self.h5_y = getattr(node, 'y')[self.start:self.stop]
         print "      end load"
+
+    def __del__(self):
+        self.h5file.close()
 
     def get_iterator(self, data_augmentator, batch_size, n_procs, n_batches=None):
         return DataIterator(self, batch_size, data_augmentator, n_procs, n_batches=n_batches)
@@ -95,7 +98,11 @@ class DataIterator(object):
 
         for i, (img, s, target) in enumerate(batch):
             img = numpy.reshape(img, s)
+            # plt.imshow(img)
+            # plt.show()
             new_imgs = self.data_augmentator.process_image([img])
+            # plt.imshow(new_imgs[0])
+            # plt.show()
 
             y[i] = target
             for a, img in enumerate(new_imgs):
@@ -238,10 +245,11 @@ class ScaleMinSide(DataAugmentator):
         self.min_side = min_side
 
     def process_image_virtual(self, img):
-        min_axis = min(img.shape[0:2])
+        min_axis = numpy.min(img.shape[0:2])
         ratio = self.min_side / float(min_axis)
+        new_shape = int(round(img.shape[0]*ratio)), int(round(img.shape[1]*ratio))
         # a = scipy.ndimage.interpolation.zoom(img, (ratio, ratio, 1), order=0)
-        a = misc.imresize(img, ratio)
+        a = misc.imresize(img, new_shape)
         return [a]
 
     def get_final_shape_virtual(self, shape):
@@ -336,6 +344,51 @@ class RandomCropping(DataAugmentator):
         return [(self.crop_size, self.crop_size, 3)]
 
 
+class Cropping5Views(DataAugmentator):
+    def __init__(self, crop_size, random_shift, child=None):
+        DataAugmentator.__init__(self, child)
+        self.crop_size = crop_size
+        self.random_shift = random_shift
+
+    def generate_shift(self):
+        shift_x = numpy.random.randint(0, self.random_shift)
+        shift_y = numpy.random.randint(0, self.random_shift)
+        return shift_x, shift_y
+
+    def process_image_virtual(self, img):
+        lx, ly, _ = img.shape
+
+        # top left corner
+        x, y = self.generate_shift()
+        tl_img = img[x:x+self.crop_size, -y-self.crop_size:-y, :]
+
+        # top right corner
+        x, y = self.generate_shift()
+        tr_img = img[-x-self.crop_size:-x, -y-self.crop_size:-y, :]
+
+        # bottom right corner
+        x, y = self.generate_shift()
+        br_img = img[-x-self.crop_size:-x, y:y+self.crop_size, :]
+
+        # bottom left corner
+        x, y = self.generate_shift()
+        bl_img = img[x:x+self.crop_size, y:y+self.crop_size, :]
+
+        # central image
+        mid_x, mid_y = lx/2, ly/2
+        b = (self.crop_size + self.random_shift)/2
+        pos_x, pos_y = mid_x - b, mid_y - b
+        x, y = self.generate_shift()
+        pos_x += x
+        pos_y += y
+        c_img = img[pos_x:pos_x+self.crop_size, pos_y:pos_y+self.crop_size, :]
+
+        return [tl_img, tr_img, br_img, bl_img, c_img]
+
+    def get_final_shape_virtual(self, shape):
+        return [(self.crop_size, self.crop_size, 3)]*5
+
+
 class HorizontalFlip(DataAugmentator):
     def __init__(self, child=None):
         DataAugmentator.__init__(self, child)
@@ -382,7 +435,6 @@ class RotatePreciseAngle(DataAugmentator):
 class ParallelDataAugmentator(DataAugmentator):
     """
     Generate several augmented images from a single one.
-    process_image returns a list!
     """
     def __init__(self, data_agumentators, child=None):
         DataAugmentator.__init__(self, child)

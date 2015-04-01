@@ -41,7 +41,7 @@ def compare_records(ls_files, writeto, xlim, ylim, dataset, measure):
     legends = []
     for (path, descript) in ls_files:
         for ds in dataset:
-            channels = extract_records(path + "channels.pkl")[ds][measure]
+            channels = extract_records(path)[ds][measure]
             records.append(channels)
             legends.append(descript + " (" + measure + "_" + ds + ")")
 
@@ -51,7 +51,7 @@ def compare_records(ls_files, writeto, xlim, ylim, dataset, measure):
 
 if __name__ == '__main__':
 
-    name = "mod8"
+    name = "multi_view/comp_pretrain_valid"
     # ls_files = [
     #             # ("./results/lasagne/mod_7_1/", ""),
     #             # ("./results/lasagne/mod_7_smaller1/", "smaller"),
@@ -62,8 +62,18 @@ if __name__ == '__main__':
     #             ("./results/lasagne/mod_7_smaller2_nomaxpool_3every1/", "only 3x3"),
     #             ("./results/lasagne/mod_7_top1/", "only 3x3 top")]
 
-    ls_files = [("./mod_8_all/", "mod 8")]
+    ls_files = [
+        ("./multi_view/c_1view.pkl", "1 view"),
+                ("./multi_view/c_5views_mean.pkl", "5 views mean"),
+                # ("./multi_view/c_5views_dropout_branches.pkl", "5 views mean "
+                #                                               "dropout "
+                #                                               "branches"),
+                # ("./multi_view/c_5views_max.pkl", "5 views max"),
+                # ("./multi_view/c_5views_l2.pkl", "5 views l2"),
+                ("./multi_view/c_5views_pretrained.pkl", "5 views mean "
+                                                          "pretrained")
+                ]
     compare_records(ls_files, name, xlim=(0,200),
-                            ylim=(0.00,0.1),
-                            dataset=["valid", "training"],
+                            ylim=(0.06,0.15),
+                            dataset=["valid"],
                             measure="err",)

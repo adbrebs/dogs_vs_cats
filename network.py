@@ -1,15 +1,16 @@
 import pickle
 import numpy
+from theano import tensor as T
 
 import lasagne
-from selector import *
+from custom_layers import *
 
 
 class Network:
     def __init__(self, n_chunks, input_width, input_height, output_dim, batch_size):
 
         self.name = self.__class__.__name__
-        self.n_chunks = n_chunks
+        self.n_branches = n_chunks
         self.input_width = input_width
         self.input_height = input_height
         self.output_dim = output_dim
@@ -18,14 +19,14 @@ class Network:
         self.l_ins = None
         self.concat_in = None
 
-        self.create_model(  )
+        self.create_model()
 
     def create_model(self):
 
         print("Building model...")
 
         self.l_ins = []
-        for i in range(self.n_chunks):
+        for i in range(self.n_branches):
             l_in = lasagne.layers.InputLayer(
                 shape=(self.batch_size, 3, self.input_width, self.input_height),
                 )
@@ -43,11 +44,14 @@ class Network:
         raise NotImplementedError
 
     def combine_features(self, layer):
+        """
+        quite slow, use pool_over_branches instead
+        """
         ls_selectors = []
 
-        step = 1 / float(self.n_chunks)
-        for i in range(self.n_chunks):
-            a = i / float(self.n_chunks)
+        step = 1 / float(self.n_branches)
+        for i in range(self.n_branches):
+            a = i / float(self.n_branches)
             select = Selector(
                 layer,
                 numpy.array([a, a+step])
@@ -55,6 +59,38 @@ class Network:
             ls_selectors.append(select)
 
         return lasagne.layers.ElemwiseSumLayer(ls_selectors, coeffs=step)
+
+    def pool_over_branches(self, layer, pool_function=T.max):
+        """
+        pools feature by feature over branches
+        """
+        if self.n_branches == 1:
+            return layer
+
+        reshaped_layer = lasagne.layers.ReshapeLayer(layer, (self.n_branches, self.batch_size, -1))
+        reshaped_layer = lasagne.layers.DimshuffleLayer(reshaped_layer, (1, 0, 2))
+        reshaped_layer = lasagne.layers.ReshapeLayer(reshaped_layer, (self.batch_size, -1))
+
+        return lasagne.layers.FeaturePoolLayer(reshaped_layer, self.n_branches, 1, pool_function=pool_function)
+
+    def aggregate_over_branches(self, layer):
+        if self.n_branches == 1:
+            return layer
+
+        reshaped_layer = lasagne.layers.ReshapeLayer(layer, (self.n_branches, self.batch_size, -1))
+        reshaped_layer = lasagne.layers.DimshuffleLayer(reshaped_layer, (1, 0, 2))
+
+        conv = lasagne.layers.Conv1DLayer(
+            reshaped_layer,
+            num_filters=1,
+            filter_length=1,
+            nonlinearity=lasagne.nonlinearities.rectify,
+            W=lasagne.init.Constant(1.0/self.n_branches),
+            b=lasagne.init.Constant(0),
+            untie_biases=True
+            )
+
+        return conv
 
     def save(self, path):
         all_params = lasagne.layers.get_all_params(self.l_out)

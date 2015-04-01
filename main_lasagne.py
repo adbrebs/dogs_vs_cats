@@ -3,6 +3,7 @@ import itertools
 import sys
 import time
 import os
+import argparse
 import numpy as np
 
 import theano
@@ -11,7 +12,7 @@ theano.config.floatX = "float32"
 import lasagne
 
 from dataset import *
-from models.mod_8 import Network_8
+from models.mod_9 import Network_9
 from updates import momentum_bis
 
 
@@ -22,7 +23,7 @@ def create_iter_functions(model, learning_rate, momentum):
     y_batch = T.ivector('y')
     l_out = model.l_out
 
-    objective = lasagne.objectives.Objective(l_out, loss_function=lasagne.objectives.multinomial_nll)
+    objective = lasagne.objectives.Objective(l_out, loss_function=lasagne.objectives.categorical_crossentropy)
 
     loss_train = objective.get_loss(target=y_batch)
     loss_eval = objective.get_loss(target=y_batch, deterministic=True)
@@ -34,12 +35,10 @@ def create_iter_functions(model, learning_rate, momentum):
     error_rate = T.mean(T.neq(pred, y_batch))
 
     Xs_batch = [l_in.input_var for l_in in model.l_ins]
-    f_pred = theano.function(Xs_batch, [l_out.get_output(deterministic=True)], on_unused_input='ignore')
+    f_pred = theano.function(Xs_batch, [l_out.get_output(deterministic=True)])
 
     all_params = lasagne.layers.get_all_params(l_out)
     updates, extra_params = momentum_bis(loss_train, all_params, learning_rate, momentum)
-    # updates = lasagne.updates.adadelta(loss_train, all_params, learning_rate)
-    # updates = lasagne.updates.sgd(loss_train, all_params, learning_rate)
 
     iter_train = theano.function(
         Xs_batch + [y_batch], [loss_train, error_rate],
@@ -78,7 +77,6 @@ def iter_over_epoch(iterator, iter_fun, losses, error_rates):
     losses.append(avg_loss)
     error_rates.append(avg_err)
     return avg_loss, avg_err
-
 
 
 def train(iter_funcs, model,
@@ -154,61 +152,64 @@ def train(iter_funcs, model,
             'valid_error': valid_avg_err,
             }
 
+import socket
+host = socket.gethostname()
 
-if __name__ == '__main__':
+
+def main(batch_size=50):
+    # # For pretraining
+    # model_to_be_loaded = pickle.load(open("/Tmp/debrea/cat/mod_9_1view/" +
+    #                                  "mod_best.pkl", "rb"))
 
     # Setup
-    n_chunks = 5
-    name_experiment="mod_8_all"
+    n_branches = 5
+    name_experiment="mod_9_tata"
     write_path = "/Tmp/debrea/cat/" + name_experiment + "/"
     if not os.path.exists(write_path):
         os.makedirs(write_path)
-    n_procs = multiprocessing.cpu_count()-3
+    if host == "adeb.laptop":
+        n_procs = 1
+    else:
+        n_procs = multiprocessing.cpu_count()-4
 
-    num_epochs = 1000
-    batch_size = 20
+    num_epochs = 500
     initial_lr = 1e-2
     momentum = 0.9
-    patience_max = 15
+    patience_max = 10
 
     # Data_agumentation
-    image_width = 260
-    min_side = 260 # TODO BUG
+    image_width = 70
+    min_side = 70
 
     scale_min = ScaleMinSide(min_side)
     crop = RandomCropping(image_width)
-
-    # rot = RandomRotate(30, child=crop)
-    #
-    # rot = RandomRotate(30, child=rot)
-    # rot = RandomRotate(30, child=rot)
-    # rot = RandomRotate(30, child=rot)
-    # rot = RandomRotate(30, child=rot)
-
-    # scale = Scale((image_width,image_width,3))
-    #
-    # choose = RandomizeMultiple([scale, crop])
-    #
     h_flip = HorizontalFlip()
     rand_h_flip = RandomizeSingle(h_flip, 0.5, child=crop)
     rot_30 = RandomRotate(30, child=rand_h_flip)
-    d5 = ParallelDataAugmentator([rot_30]*n_chunks, child=scale_min)
+    d5 = ParallelDataAugmentator([rot_30]*n_branches, child=scale_min)
     d_train = d5
     d_valid = d5
     pickle.dump((d_train, d_valid), open(write_path + "data_agumentation.pkl", "wb"))
 
     # Creation of the datasets
-    dataset_train = Dataset(start=0, stop=20000)
-    dataset_valid = Dataset(start=20000, stop=22500)
+    if host == "adeb.laptop":
+        dataset_train = Dataset(start=0, stop=2000)
+        dataset_valid = Dataset(start=2000, stop=2500)
+    else:
+        dataset_train = Dataset(start=0, stop=20000)
+        dataset_valid = Dataset(start=20000, stop=25000)
 
     # Creation of the model
-    model = Network_8(
-        n_chunks=n_chunks,
+    model = Network_9(
+        n_chunks=n_branches,
         input_height=image_width,
         input_width=image_width,
         output_dim=2,
         batch_size=batch_size
     )
+
+    # # for pre-training
+    # model.copy_from_other_model(model_to_be_loaded)
 
     # Creation of the iterative functions
     learning_rate = theano.shared(numpy.float32(initial_lr), "learning_rate")
@@ -234,3 +235,7 @@ if __name__ == '__main__':
 
         if epoch['number'] >= num_epochs:
             break
+
+
+if __name__ == '__main__':
+    main()
