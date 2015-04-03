@@ -48,7 +48,7 @@ def evaluate(dataset, data_augmentator, batch_size, pred_fun, n_avg, name):
     batch_accuracies = []
     misclassified_examples = []
 
-    for b, (batches, qsize) in enumerate(iterator.parallel_generation(n_times=n_avg, num_cached=3)):
+    for b, (batches, qsize) in enumerate(iterator.generate_batches_in_parallel(n_times=n_avg, num_cached=3)):
         print "\r{}/{}, qsize {}".format(b, iterator.n_batches, qsize),
         sys.stdout.flush()
 

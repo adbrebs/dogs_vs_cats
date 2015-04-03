@@ -65,7 +65,7 @@ def create_iter_functions(model, learning_rate, momentum):
 def iter_over_epoch(iterator, iter_fun, losses, error_rates):
     batch_losses = []
     batch_errors = []
-    for b, ([(batch, _)], qsize) in enumerate(iterator.parallel_generation()):
+    for b, ([(batch, _)], qsize) in enumerate(iterator.generate_batches_in_parallel()):
         print "\r{}/{}, qsize {}".format(b, iterator.n_batches, qsize),
         sys.stdout.flush()
         batch_loss, batch_err = iter_fun(*batch)
@@ -162,8 +162,8 @@ def main(batch_size=50):
     #                                  "mod_best.pkl", "rb"))
 
     # Setup
-    n_branches = 5
-    name_experiment="mod_9_tata"
+    n_branches = 1
+    name_experiment="mod_9_tata_aggregate_fullyCon"
     write_path = "/Tmp/debrea/cat/" + name_experiment + "/"
     if not os.path.exists(write_path):
         os.makedirs(write_path)

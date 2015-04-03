@@ -92,6 +92,24 @@ class Network:
 
         return conv
 
+    def aggregate_over_branches2(self, layer):
+        if self.n_branches == 1:
+            return layer
+
+        reshaped_layer = lasagne.layers.ReshapeLayer(layer, (self.n_branches, self.batch_size, -1))
+        reshaped_layer = lasagne.layers.DimshuffleLayer(reshaped_layer, (1, 0, 2))
+        reshaped_layer = lasagne.layers.ReshapeLayer(reshaped_layer, (self.batch_size, -1))
+
+        dense = lasagne.layers.DenseLayer(
+            reshaped_layer,
+            num_units=reshaped_layer.get_output_shape()[1]/self.n_branches,
+            nonlinearity=lasagne.nonlinearities.rectify,
+            W=lasagne.init.Uniform(0.1),
+            b=lasagne.init.Constant(0),
+            )
+
+        return dense
+
     def save(self, path):
         all_params = lasagne.layers.get_all_params(self.l_out)
         all_param_values = [p.get_value() for p in all_params]

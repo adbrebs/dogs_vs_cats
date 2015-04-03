@@ -31,21 +31,6 @@ class Dataset():
         dataset_cache = cache.datasetCache
         self.path = dataset_cache.cache_file(path)
 
-        print "   load data on RAM"
-        self.h5file = tables.openFile(self.path, mode="r")
-        node = self.h5file.getNode('/', 'Data')
-        self.h5_x = getattr(node, 'X')[self.start:self.stop]
-        self.h5_s = getattr(node, 's')[self.start:self.stop]
-        self.h5_y = getattr(node, 'y')[self.start:self.stop]
-        s = 0
-        for img in self.h5_x:
-            s += img.nbytes
-        print "      size: " + str(s / 1024**2)
-        print "      end load"
-
-    def __del__(self):
-        self.h5file.close()
-
     def get_iterator(self, data_augmentator, batch_size, n_procs, n_batches=None):
         return DataIterator(self, batch_size, data_augmentator, n_procs, n_batches=n_batches)
 
@@ -63,7 +48,6 @@ class DataIterator(object):
             self.n_batches = dataset.n_data / batch_size
         else:
             self.n_batches = n_batches
-        self.batch_id = 0
 
         self.permutation = numpy.random.permutation(dataset.n_data)
 
@@ -75,28 +59,29 @@ class DataIterator(object):
         Returns a single batch corresponding to idx_batch
         """
         pos = idx_batch * self.batch_size
-        indices = self.permutation[pos: pos + self.batch_size]
-        return [(self.dataset.h5_x[i], self.dataset.h5_s[i], self.dataset.h5_y[i]) for i in indices], indices
+        indices = self.dataset.start + self.permutation[pos: pos + self.batch_size]
+        return indices
 
     def get_batches(self, idx_batches):
         """
         Returns several batches correponding to idx_batches
         """
-        batches = [0]*len(idx_batches)
         indices = [0]*len(idx_batches)
         for i, idx in enumerate(idx_batches):
-            batches[i], indices[i] = self.get_batch(idx)
-        return batches, indices
+            indices[i] = self.get_batch(idx)
+        return indices
 
-    def generate_sequence(self, batch, batch_of_indices):
+    def generate_single_batch(self, batch_of_indices, h5_x, h5_s, h5_y):
 
+        # Initialize containers
         x = []
         for shape in self.shape_batch:
             x.append(numpy.zeros(shape, dtype=theano.config.floatX))
-
         y = numpy.zeros((self.batch_size,), dtype='int32')
 
-        for i, (img, s, target) in enumerate(batch):
+        for i, idx in enumerate(batch_of_indices):
+            img, s, target = h5_x[idx], h5_s[idx], h5_y[idx]
+
             img = numpy.reshape(img, s)
             # plt.imshow(img)
             # plt.show()
@@ -113,43 +98,87 @@ class DataIterator(object):
 
         return x + [y], batch_of_indices + self.dataset.start
 
-    def parallel_generation(self, n_times=1, num_cached=30):
+    def create_batch_indices(self):
+        n_batches = self.dataset.n_data / self.batch_size
+        batches = range(n_batches)
+        n_batches_per_proc = int(math.ceil(float(n_batches) / self.n_procs))
+        proc_idx_batches = [batches[i:i + n_batches_per_proc]
+                            for i in range(0, (self.n_procs-1)*n_batches_per_proc, n_batches_per_proc)]
+        proc_idx_batches.append(batches[(self.n_procs-1)*n_batches_per_proc:])
+        return proc_idx_batches, n_batches
+
+    def generate_batches_in_parallel(self, n_times=1, num_cached=30):
         """
-        Sequence
+        Generates batches in multiple processes and load the batches in a queue.
+        All the processes are responsible for the same number of batches.
+        n_times is useful if you want to use several branches in you multi-view
+        architecture (same data augmentation for each view)
         """
         try:
             queue = multiprocessing.Queue(maxsize=num_cached)
 
-            n_batches = self.dataset.n_data / self.batch_size
-            batches = range(n_batches)
-            n_batches_per_proc = int(math.ceil(float(n_batches) / self.n_procs))
-            proc_idx_batches = [batches[i:i + n_batches_per_proc]
-                                for i in range(0, (self.n_procs-1)*n_batches_per_proc, n_batches_per_proc)]
-            proc_idx_batches.append(batches[(self.n_procs-1)*n_batches_per_proc:])
+            proc_idx_batches, n_batches = self.create_batch_indices()
 
             # define producer (putting items into queue)
-            def producer(batches_of_points, batches_of_indices):
-                for batch_of_points, batch_of_indices in zip(batches_of_points, batches_of_indices):
-                    queue.put([self.generate_sequence(batch_of_points, batch_of_indices)
-                               for _ in range(n_times)])
+            def producer(batches_of_indices):
 
-            threads = []
+                try:
+                    h5file = tables.openFile(self.dataset.path, mode="r")
+                    node = h5file.getNode('/', 'Data')
+                    h5_x = getattr(node, 'X')
+                    h5_s = getattr(node, 's')
+                    h5_y = getattr(node, 'y')
+
+
+                    for batch_of_indices in batches_of_indices:
+                        queue.put([self.generate_single_batch(batch_of_indices, h5_x, h5_s, h5_y)
+                                   for _ in range(n_times)])
+                except:
+                    "print close hdf5 files"
+                    h5file.close()
+
+            processes = []
             for i in xrange(self.n_procs):
                 thread = multiprocessing.Process(
                     target=producer,
-                    args=self.get_batches(proc_idx_batches[i]))
+                    args=(self.get_batches(proc_idx_batches[i]),))
+                time.sleep(0.01)
                 thread.start()
-                threads.append(thread)
+                processes.append(thread)
 
             # run as consumer (read items from queue, in current thread)
             for i in range(n_batches):
                 yield queue.get(), queue.qsize()
         except:
             print "SALUT TOI"
-            for th in threads:
+            for th in processes:
                 th.terminate()
             queue.close()
             raise
+
+    def generate_batches_sequentially(self, n_times=1):
+        """
+        Generates batches sequentitially (in one process)
+        """
+        if self.n_procs != 1:
+            print "generate batches sequentially only works with a single " \
+                  "process. Setting the variable to 1."
+            self.n_procs = 1
+
+        h5file = tables.openFile(self.dataset.path, mode="r")
+        node = h5file.getNode('/', 'Data')
+        h5_x = getattr(node, 'X')
+        h5_s = getattr(node, 's')
+        h5_y = getattr(node, 'y')
+
+        proc_idx_batches, n_batches = self.create_batch_indices()
+        idx_batches = proc_idx_batches[0]
+
+        for idx_batch in idx_batches:
+            batch_of_indices = self.get_batch(idx_batch)
+            batch = [self.generate_single_batch(
+                batch_of_indices, h5_x, h5_s, h5_y) for _ in range(n_times)]
+            yield batch, 0
 
     def swap_axis_and_norm(self, a):
         a = numpy.swapaxes(a, 3, 2)
@@ -329,6 +358,19 @@ class Zoom(DataAugmentator):
         return [(shape[0] * self.zoom, shape[1] * self.zoom, shape[2])]
 
 
+class RandomZoom(DataAugmentator):
+    def __init__(self, max_zoom, child=None):
+        DataAugmentator.__init__(self, child)
+        self.max_zoom = max_zoom
+
+    def process_image_virtual(self, img):
+        zoom = numpy.random.uniform(1.0, self.max_zoom)
+        return [misc.imresize(img, zoom)]
+
+    def get_final_shape_virtual(self, shape):
+        return [None]
+
+
 class RandomCropping(DataAugmentator):
     def __init__(self, crop_size, child=None):
         DataAugmentator.__init__(self, child)
@@ -351,8 +393,8 @@ class Cropping5Views(DataAugmentator):
         self.random_shift = random_shift
 
     def generate_shift(self):
-        shift_x = numpy.random.randint(0, self.random_shift)
-        shift_y = numpy.random.randint(0, self.random_shift)
+        shift_x = numpy.random.randint(0, 1 + self.random_shift)
+        shift_y = numpy.random.randint(0, 1 + self.random_shift)
         return shift_x, shift_y
 
     def process_image_virtual(self, img):
@@ -360,15 +402,15 @@ class Cropping5Views(DataAugmentator):
 
         # top left corner
         x, y = self.generate_shift()
-        tl_img = img[x:x+self.crop_size, -y-self.crop_size:-y, :]
+        tl_img = img[x:x+self.crop_size, -y-self.crop_size-1:-y-1, :]
 
         # top right corner
         x, y = self.generate_shift()
-        tr_img = img[-x-self.crop_size:-x, -y-self.crop_size:-y, :]
+        tr_img = img[-x-self.crop_size-1:-x-1, -y-self.crop_size-1:-y-1, :]
 
         # bottom right corner
         x, y = self.generate_shift()
-        br_img = img[-x-self.crop_size:-x, y:y+self.crop_size, :]
+        br_img = img[-x-self.crop_size-1:-x-1, y:y+self.crop_size, :]
 
         # bottom left corner
         x, y = self.generate_shift()
@@ -419,7 +461,7 @@ class RandomRotate(DataAugmentator):
         self.max_angle = max_angle
 
     def process_image_virtual(self, img):
-        angle = numpy.random.randint(-self.max_angle, self.max_angle)
+        angle = numpy.random.randint(-self.max_angle, self.max_angle+1)
         return [scipy.ndimage.interpolation.rotate(img, angle, reshape=False, mode="nearest", order=0)]
 
 

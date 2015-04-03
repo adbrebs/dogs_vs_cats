@@ -56,8 +56,9 @@ class Network_9(Network):
 
         # concat_out = self.combine_features(l_pool3)
 
-        concat_out = self.pool_over_branches(l_pool3, T.mean)
+        concat_out = self.pool_over_branches(l_pool3, T.max)
         # concat_out = self.aggregate_over_branches(l_pool3)
+        # concat_out = self.aggregate_over_branches2(l_pool3)
 
         l_hidden1 = lasagne.layers.DenseLayer(
             concat_out,
